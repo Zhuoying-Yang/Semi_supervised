@@ -113,36 +113,28 @@ def generate_pseudo_labels(model, unlabeled_folds, base_path, device, threshold=
 
 
 def combine_and_retrain(model, labeled_data, pseudo_data, device):
-    x_pseudo = torch.stack([x for x, y in pseudo_data])  # shape: [N, 2, 7680]
+    # Step 1: Create a TensorDataset for the pseudo-labeled data
+    x_pseudo = torch.stack([x for x, y in pseudo_data])
     y_pseudo = torch.tensor([y for x, y in pseudo_data])
     pseudo_dataset = TensorDataset(x_pseudo, y_pseudo)
     
+    # Step 2: Convert the original labeled data into a TensorDataset
     converted_labeled = []
     for ch1, ch2, label, _ in labeled_data:
         x = torch.stack([ch1, ch2], dim=0)
         converted_labeled.append((x, label))
-
+    
     x_labeled = torch.stack([x for x, y in converted_labeled])
     y_labeled = torch.tensor([y for x, y in converted_labeled])
     labeled_dataset = TensorDataset(x_labeled, y_labeled)
+    
+    # Step 3: Combine both datasets
     full_x = torch.cat([x_labeled, x_pseudo], dim=0)
     full_y = torch.cat([y_labeled, y_pseudo], dim=0)
     full_dataset = TensorDataset(full_x, full_y)
-
-    train_loader = DataLoader(full_dataset, batch_size=64, shuffle=True)
-    # Convert labeled_data to TensorDataset
-    converted_labeled = []
-    for ch1, ch2, label, _ in labeled_data:
-        x = torch.stack([ch1, ch2], dim=0)
-        converted_labeled.append((x, label))
     
-    x_labeled = torch.stack([x for x, y in converted_labeled])
-    y_labeled = torch.tensor([y for x, y in converted_labeled])
-    labeled_dataset = TensorDataset(x_labeled, y_labeled)
-    
-    # Now pass this to train_model
-    train_model(model, labeled_dataset, device)
-
+    # Step 4: Call the train_model function with the CORRECT full_dataset
+    train_model(model, full_dataset, device) 
 
 if __name__ == "__main__":
     base_path = "/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch"
