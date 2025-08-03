@@ -48,7 +48,7 @@ class SimpleCNN(nn.Module):
 def load_labeled_data(folds, base_path):
     data = []
     for fold in folds:
-        train_set = torch.load(os.path.join(base_path, str(fold), "train_set.pt"))
+        train_set = torch.load(os.path.join(base_path, str(fold), "train_set.pt"), weights_only=False)
         data.extend(train_set)
     return data
 
@@ -104,7 +104,19 @@ def combine_and_retrain(model, labeled_data, pseudo_data, device):
     full_dataset = TensorDataset(full_x, full_y)
 
     train_loader = DataLoader(full_dataset, batch_size=64, shuffle=True)
-    train_model(model, train_loader, device)
+    # Convert labeled_data to TensorDataset
+    converted_labeled = []
+    for ch1, ch2, label, _ in labeled_data:
+        x = torch.stack([ch1, ch2], dim=0)
+        converted_labeled.append((x, label))
+    
+    x_labeled = torch.stack([x for x, y in converted_labeled])
+    y_labeled = torch.tensor([y for x, y in converted_labeled])
+    labeled_dataset = TensorDataset(x_labeled, y_labeled)
+    
+    # Now pass this to train_model
+    train_model(model, labeled_dataset, device)
+
 
 if __name__ == "__main__":
     base_path = "/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch"
