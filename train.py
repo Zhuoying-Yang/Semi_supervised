@@ -125,8 +125,7 @@ def combine_and_retrain(model, labeled_data, pseudo_data, device):
     x_labeled = torch.stack([x for x, y in converted_labeled])
     y_labeled = torch.tensor([y for x, y in converted_labeled])
     labeled_dataset = TensorDataset(x_labeled, y_labeled)
-
-    full_x = torch.cat([x_labeled, x_pseudo], dim=0)
+    full_x = torch.cat([x_labeled, x_pseudo], dim=val_set0)
     full_y = torch.cat([y_labeled, y_pseudo], dim=0)
     full_dataset = TensorDataset(full_x, full_y)
 
@@ -178,7 +177,10 @@ if __name__ == "__main__":
 
     print("Step 4: Evaluate on held-out test fold")
     test_fold = 10  
-    test_set = torch.load(os.path.join(base_path, str(test_fold), "val_set.pt"))
+    test_set = torch.load(os.path.join(base_path, str(test_fold), "val_set.pt"), weights_only=False)
     evaluate_model(model, test_set, device)
+    
+    torch.save(model.state_dict(), "semi_model_CNN.pt")
+    print("Model saved as semi_model_CNN.pt")
   
     print("Done!")
