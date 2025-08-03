@@ -125,7 +125,7 @@ def combine_and_retrain(model, labeled_data, pseudo_data, device):
     x_labeled = torch.stack([x for x, y in converted_labeled])
     y_labeled = torch.tensor([y for x, y in converted_labeled])
     labeled_dataset = TensorDataset(x_labeled, y_labeled)
-    full_x = torch.cat([x_labeled, x_pseudo], dim=val_set0)
+    full_x = torch.cat([x_labeled, x_pseudo], dim=0)
     full_y = torch.cat([y_labeled, y_pseudo], dim=0)
     full_dataset = TensorDataset(full_x, full_y)
 
