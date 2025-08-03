@@ -129,7 +129,17 @@ if __name__ == "__main__":
     model = SimpleCNN().to(device)
 
     print("Step 1: Training initial model")
-    train_model(model, labeled_data, device)
+    # Convert labeled_data to TensorDataset before training
+    converted_labeled = []
+    for ch1, ch2, label, _ in labeled_data:
+        x = torch.stack([ch1, ch2], dim=0)
+        converted_labeled.append((x, label))
+    
+    x_labeled = torch.stack([x for x, y in converted_labeled])
+    y_labeled = torch.tensor([y for x, y in converted_labeled])
+    labeled_dataset = TensorDataset(x_labeled, y_labeled)
+
+    train_model(model, labeled_dataset, device)
 
     print("Step 2: Generating pseudo labels")
     pseudo_data = generate_pseudo_labels(model, unlabeled_folds, base_path, device)
