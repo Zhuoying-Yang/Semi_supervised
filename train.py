@@ -7,6 +7,7 @@ from data_preparation import SleepDataset_2_chan
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
+import time
 
 def evaluate_model(model, test_set, device):
     model.eval()
@@ -52,13 +53,20 @@ def load_labeled_data(folds, base_path):
         data.extend(train_set)
     return data
 
-def train_model(model, train_data, device, epochs=10, lr=1e-3):
+def train_model(model, train_data, device, epochs=300, lr=1e-3, patience=20):
     train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     model.train()
+    
+    best_loss = float('inf')
+    wait = 0
+
     for epoch in range(epochs):
         total_loss = 0
+        correct = 0
+        total = 0
+
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
@@ -67,14 +75,33 @@ def train_model(model, train_data, device, epochs=10, lr=1e-3):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}, Loss = {total_loss:.4f}")
+
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+        avg_loss = total_loss
+        acc = correct / total
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1}, Loss = {avg_loss:.4f}, Accuracy = {acc:.4f}")
+
+        # Early stopping check
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
 
 def generate_pseudo_labels(model, unlabeled_folds, base_path, device, threshold=0.9):
     pseudo_data = []
     model.eval()
     with torch.no_grad():
         for fold in unlabeled_folds:
-            val_set = torch.load(os.path.join(base_path, str(fold), "val_set.pt"))
+            val_set = torch.load(os.path.join(base_path, str(fold), "val_set.pt"), weights_only=False)
             for ch1, ch2, label, patient_no in val_set:
                 x = torch.stack([ch1, ch2], dim=0).unsqueeze(0).to(device)  # [1, 2, 7680]
                 out = model(x)
