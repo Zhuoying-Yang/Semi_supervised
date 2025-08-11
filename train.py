@@ -141,7 +141,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     labeled_folds = [0, 2, 4, 6, 8]
-    unlabeled_folds = [i for i in range(0, 62, 2) if i not in labeled_folds]
+    unlabeled_folds = [i for i in range(0, 62, 2) if (i not in labeled_folds and i != 10)]
 
     labeled_data = load_labeled_data(labeled_folds, base_path)
     model = SimpleCNN().to(device)
