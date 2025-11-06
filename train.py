@@ -11,22 +11,40 @@ import time
 
 def evaluate_model(model, test_set, device):
     model.eval()
-    test_loader = DataLoader(test_set, batch_size=64)
+    
+    # ADDED: Convert raw list data to TensorDataset for proper batching
+    converted_test = []
+    for ch1, ch2, label, _ in test_set:
+        x = torch.stack([ch1, ch2], dim=0) # [2, 7680]
+        converted_test.append((x, label))
+    
+    x_test = torch.stack([x for x, y in converted_test])
+    y_test = torch.tensor([y for x, y in converted_test])
+    test_dataset = TensorDataset(x_test, y_test)
+
+    # Use the correctly formatted TensorDataset
+    test_loader = DataLoader(test_dataset, batch_size=64)
     all_preds = []
     all_labels = []
+
     with torch.no_grad():
-        for ch1, ch2, label, pno in test_set:
-            x = torch.stack([ch1, ch2], dim=0).unsqueeze(0).to(device)
+        # Correctly iterate over the DataLoader (batches)
+        for x, y in test_loader: 
+            x = x.to(device)
+            # y contains the true labels for the batch
+
             out = model(x)
-            pred = torch.argmax(out, dim=1).cpu().item()
-            all_preds.append(pred)
-            all_labels.append(label.item())
+            
+            preds = torch.argmax(out, dim=1).cpu().tolist()
+            labels = y.cpu().tolist()
+
+            all_preds.extend(preds)
+            all_labels.extend(labels)
 
     print("Classification Report:")
     print(classification_report(all_labels, all_preds, digits=4))
     print("Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
-
 
 class SimpleCNN(nn.Module):
     def __init__(self, in_channels=2, n_classes=5):  # in_channels=2 for ch1 + ch2
