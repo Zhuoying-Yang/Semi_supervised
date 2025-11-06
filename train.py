@@ -190,8 +190,10 @@ if __name__ == "__main__":
     test_set = torch.load(os.path.join(base_path, str(test_fold), "val_set.pt"), weights_only=False)
     evaluate_model(model, test_set, device)
     
-    # Updated model save line in semi.py:
-    torch.save(model.state_dict(), "/project/def-xilinliu/$USER/outputs/semi_model_CNN.pt")
+    SCRATCH_SAVE_PATH = os.path.join(os.environ['SCRATCH'], "semi_model_CNN.pt") 
+    
+    # Save the model to high-quota scratch space
+    torch.save(model.state_dict(), SCRATCH_SAVE_PATH)
     print("Model saved as semi_model_CNN.pt")
   
     print("Done!")
