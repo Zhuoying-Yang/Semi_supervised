@@ -190,7 +190,8 @@ if __name__ == "__main__":
     test_set = torch.load(os.path.join(base_path, str(test_fold), "val_set.pt"), weights_only=False)
     evaluate_model(model, test_set, device)
     
-    torch.save(model.state_dict(), "semi_model_CNN.pt")
+    # Updated model save line in semi.py:
+    torch.save(model.state_dict(), "/project/def-xilinliu/$USER/outputs/semi_model_CNN.pt")
     print("Model saved as semi_model_CNN.pt")
   
     print("Done!")
