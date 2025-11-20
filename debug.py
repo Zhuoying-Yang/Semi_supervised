@@ -60,7 +60,7 @@ else:
 # ==========================================
 # CHECK 2: ROBUST SUBJECT LEAKAGE
 # ==========================================
-print("\n🔍 CHECK 2: SUBJECT OVERLAP (FIXED)")
+print("\nCHECK 2: SUBJECT OVERLAP (FIXED)")
 overlap_found = False
 
 for fold in train_folds:
@@ -91,7 +91,7 @@ if not overlap_found:
 # ==========================================
 # CHECK 3: DEEP DUPLICATE SEARCH
 # ==========================================
-print("\n🔍 CHECK 3: RANDOM SAMPLE MATCHING")
+print("\nCHECK 3: RANDOM SAMPLE MATCHING")
 # Instead of checking sample 0, we check 5 random samples from Test
 import random
 indices_to_check = random.sample(range(len(test_data)), 3)
