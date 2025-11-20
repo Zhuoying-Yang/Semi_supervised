@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
+import copy
 
 # --- CONFIGURATION ---
 def get_args():
@@ -15,56 +16,35 @@ def get_args():
     parser.add_argument("--data_dir", type=str, default="/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch")
     parser.add_argument("--scratch_dir", type=str, default=os.getenv("SCRATCH", "./"))
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--confidence_threshold", type=float, default=0.85, help="Lowered threshold for pseudo-labels")
+    parser.add_argument("--lr", type=float, default=1e-3) # Back to 1e-3 for SimpleCNN
+    parser.add_argument("--confidence_threshold", type=float, default=0.90, help="Threshold for pseudo-labels")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     return parser.parse_args()
 
-# --- IMPROVED MODEL ARCHITECTURE ---
-class ImprovedSleepCNN(nn.Module):
+# --- ORIGINAL STABLE MODEL ---
+class SimpleCNN(nn.Module):
     def __init__(self, in_channels=2, n_classes=5):
-        super(ImprovedSleepCNN, self).__init__()
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=5, padding=2)
+        self.pool1 = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
+        self.pool2 = nn.MaxPool1d(2)
         
-        # Block 1: Large Kernel to capture low-frequency (Delta/Theta) waves
-        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=65, stride=2, padding=32)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.pool1 = nn.MaxPool1d(4)
-        
-        # Block 2: Medium Kernel
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=17, stride=1, padding=8)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.pool2 = nn.MaxPool1d(4)
-        
-        # Block 3: Small Kernel for high-frequency features (Spindles)
-        self.conv3 = nn.Conv1d(128, 256, kernel_size=5, stride=1, padding=2)
-        self.bn3 = nn.BatchNorm1d(256)
-        self.pool3 = nn.MaxPool1d(4)
-
-        # Block 4: Deep features
-        self.conv4 = nn.Conv1d(256, 512, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.pool4 = nn.MaxPool1d(2)
-
-        # Global Average Pooling (Reduces parameters, prevents overfitting)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
+        # Dropout prevents overfitting
         self.dropout = nn.Dropout(p=0.5)
-        self.fc = nn.Linear(512, n_classes)
+        
+        self.fc1 = nn.Linear(64 * 1920, 128) 
+        self.fc2 = nn.Linear(128, n_classes)
 
     def forward(self, x):
-        # Block 1
-        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-        # Block 2
-        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-        # Block 3
-        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-        # Block 4
-        x = self.pool4(F.relu(self.bn4(self.conv4(x))))
+        x = self.pool1(F.relu(self.conv1(x)))
+        x = self.pool2(F.relu(self.conv2(x)))
+        x = x.view(x.size(0), -1)
         
-        # Global Pooling & FC
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1) # Flatten
         x = self.dropout(x)
-        return self.fc(x)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
 
 # --- UTILS ---
 def list_to_dataset(data_list):
@@ -109,11 +89,11 @@ def get_class_weights(train_data, device):
     weights = compute_class_weight(class_weight='balanced', classes=classes, y=labels)
     return torch.tensor(weights, dtype=torch.float).to(device)
 
-# --- TRAINING LOGIC ---
-def train_loop(model, train_data, device, epochs, lr, phase_name="Supervised"):
+# --- TRAINING LOGIC WITH EARLY STOPPING ---
+def train_loop(model, train_data, device, epochs, lr, patience, phase_name="Supervised"):
     # Split by Patient
     patient_ids = sorted(list(set([item[3] for item in train_data])))
-    split_idx = int(len(patient_ids) * 0.85) # 85/15 split for better training
+    split_idx = int(len(patient_ids) * 0.85)
     train_pids = set(patient_ids[:split_idx])
     val_pids = set(patient_ids[split_idx:])
     
@@ -122,19 +102,20 @@ def train_loop(model, train_data, device, epochs, lr, phase_name="Supervised"):
     
     print(f"Train Samples: {len(train_subset)} | Val Samples: {len(val_subset)}")
 
-    train_loader = DataLoader(list_to_dataset(train_subset), batch_size=128, shuffle=True, num_workers=4)
-    val_loader = DataLoader(list_to_dataset(val_subset), batch_size=128, shuffle=False, num_workers=4)
+    train_loader = DataLoader(list_to_dataset(train_subset), batch_size=64, shuffle=True, num_workers=4)
+    val_loader = DataLoader(list_to_dataset(val_subset), batch_size=64, shuffle=False, num_workers=4)
     
-    # Calculate Class Weights (Crucial for N1 accuracy)
+    # Class Weights help with the imbalance
     class_weights = get_class_weights(train_subset, device)
     print(f"Class Weights: {class_weights.cpu().numpy()}")
 
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4) # Added weight_decay
-    
-    # FIXED: Removed verbose=True to support all PyTorch versions
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
-    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    # Early Stopping Variables
+    best_acc = 0.0
+    wait = 0
+    best_model_wts = copy.deepcopy(model.state_dict())
     
     for epoch in range(epochs):
         model.train()
@@ -162,16 +143,29 @@ def train_loop(model, train_data, device, epochs, lr, phase_name="Supervised"):
         val_acc = correct / total if total > 0 else 0
         avg_loss = total_loss / len(train_loader)
         
-        # Step the scheduler
-        scheduler.step(val_acc)
-        
         if (epoch + 1) % 1 == 0:
-             print(f"[{phase_name}] Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+             print(f"[{phase_name}] Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+        
+        # --- EARLY STOPPING CHECK ---
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_model_wts = copy.deepcopy(model.state_dict())
+            wait = 0 # Reset wait counter
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"\nEarly Stopping triggered! No improvement for {patience} epochs.")
+                print(f"Restoring best model with Acc: {best_acc:.4f}")
+                model.load_state_dict(best_model_wts)
+                break
 
-def generate_pseudo_labels(model, unlabeled_data, device, threshold=0.85):
+    # Ensure we leave with the best weights loaded
+    model.load_state_dict(best_model_wts)
+
+def generate_pseudo_labels(model, unlabeled_data, device, threshold=0.90):
     model.eval()
     pseudo_data = []
-    batch_size = 128
+    batch_size = 64
     print(f"Generating pseudo-labels for {len(unlabeled_data)} samples...")
     
     with torch.no_grad():
@@ -214,26 +208,33 @@ if __name__ == "__main__":
     print(f"Labeled Samples: {len(labeled_data)}")
 
     # 3. TRAIN TEACHER
-    model = ImprovedSleepCNN().to(device)
-    train_loop(model, labeled_data, device, epochs=30, lr=args.lr, phase_name="Teacher")
+    model = SimpleCNN().to(device)
+    # Train teacher with Early Stopping
+    train_loop(model, labeled_data, device, epochs=50, lr=args.lr, patience=args.patience, phase_name="Teacher")
 
-    # 4. LOAD UNLABELED & PSEUDO LABEL
-    unlabeled_folds = [12, 14, 16, 18] # Added more folds
+    # 4. LOAD ALL UNLABELED
+    all_folds = [i for i in range(0, 62, 2)]
+    exclude_folds = set(labeled_folds + [10])
+    unlabeled_folds = [f for f in all_folds if f not in exclude_folds]
+    
+    print(f"Loading Unlabeled Data from {len(unlabeled_folds)} folds...")
     unlabeled_data_raw = load_folds(unlabeled_folds, args.data_dir, "train_set.pt")
     unlabeled_data, _ = filter_leakage(unlabeled_data_raw, banned_pids)
     
+    # Generate Pseudo Labels
     pseudo_data = generate_pseudo_labels(model, unlabeled_data, device, threshold=args.confidence_threshold)
     
     # 5. TRAIN STUDENT
     full_data = labeled_data + pseudo_data
-    # Reset optimizer state by re-calling train_loop, but we keep the model weights
     print(f"Retraining Student on {len(full_data)} samples...")
-    train_loop(model, full_data, device, epochs=50, lr=args.lr/2, phase_name="Student")
+    
+    # Train Student with Early Stopping (reset optimizer inside)
+    train_loop(model, full_data, device, epochs=100, lr=args.lr/2, patience=args.patience, phase_name="Student")
     
     # 6. FINAL TEST
     print("\n--- FINAL TEST FOLD 10 ---")
     test_ds = list_to_dataset(test_data_raw)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -245,4 +246,4 @@ if __name__ == "__main__":
     print(classification_report(all_labels, all_preds, digits=4))
     print(confusion_matrix(all_labels, all_preds))
     
-    torch.save(model.state_dict(), os.path.join(args.scratch_dir, "improved_sleep_model.pt"))
+    torch.save(model.state_dict(), os.path.join(args.scratch_dir, "simple_sleep_model_student.pt"))
