@@ -1,90 +1,168 @@
 import os
+import sys
+import time
+import argparse
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from data_preparation import SleepDataset_2_chan
-import torch.nn.functional as F
-from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
-import time
 
-def evaluate_model(model, test_set, device):
-    model.eval()
+# --- CONFIGURATION & ARGS ---
+def get_args():
+    parser = argparse.ArgumentParser(description="Narval Sleep Staging Job")
+    parser.add_argument("--data_dir", type=str, 
+                        default="/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch",
+                        help="Path to the data directory")
+    parser.add_argument("--scratch_dir", type=str, 
+                        default=os.getenv("SCRATCH", "./"),
+                        help="Path to save models")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    return parser.parse_args()
+
+# --- SANITY CHECKS (CRITICAL) ---
+def perform_sanity_checks(labeled_data, test_set):
+    print("\n" + "="*30)
+    print("RUNNING DATA INTEGRITY CHECKS")
+    print("="*30)
+
+    # 1. Check for Patient Overlap (Subject Leakage)
+    train_patients = set([item[3] for item in labeled_data])
+    test_patients = set([item[3] for item in test_set])
+    overlap = train_patients.intersection(test_patients)
     
-    # ADDED: Convert raw list data to TensorDataset for proper batching
-    converted_test = []
-    for ch1, ch2, label, _ in test_set:
-        x = torch.stack([ch1, ch2], dim=0) # [2, 7680]
-        converted_test.append((x, label))
-    
-    x_test = torch.stack([x for x, y in converted_test])
-    y_test = torch.tensor([y for x, y in converted_test])
-    test_dataset = TensorDataset(x_test, y_test)
+    if overlap:
+        print(f"CRITICAL WARNING: SUBJECT LEAKAGE DETECTED!")
+        print(f"Patients found in both Train and Test: {overlap}")
+        print("Result: Accuracy will be artificially high (near 100%).")
+    else:
+        print("Subject Split Check: PASSED (No patient overlap)")
 
-    # Use the correctly formatted TensorDataset
-    test_loader = DataLoader(test_dataset, batch_size=64)
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        # Correctly iterate over the DataLoader (batches)
-        for x, y in test_loader: 
-            x = x.to(device)
-            # y contains the true labels for the batch
-
-            out = model(x)
+    # 2. Check for Label Leakage in Channel 2
+    # We check if Channel 2 is a flat line (constant value) which often means it's a mask/label
+    suspicious_samples = 0
+    for i in range(min(100, len(labeled_data))):
+        ch2 = labeled_data[i][1]
+        if torch.std(ch2) < 1e-4: # If standard deviation is near 0
+            suspicious_samples += 1
             
-            preds = torch.argmax(out, dim=1).cpu().tolist()
-            labels = y.cpu().tolist()
+    if suspicious_samples > 10:
+        print(f"CRITICAL WARNING: SIGNAL LEAKAGE SUSPECTED!")
+        print(f"Channel 2 has zero variance in {suspicious_samples}% of checked samples.")
+        print("It might be a hardcoded label or artifact mask.")
+    else:
+        print("Signal Variance Check: PASSED (Channels look like EEG)")
 
-            all_preds.extend(preds)
-            all_labels.extend(labels)
+    # 3. Check for Trivial Test Set (Class Imbalance)
+    test_labels = [item[2] for item in test_set]
+    unique_labels = set(test_labels)
+    if len(unique_labels) == 1:
+        print(f" WARNING: TRIVIAL TEST SET")
+        print(f"Test set only contains Class {list(unique_labels)[0]}.")
+        print("Model can get 100% by guessing one class.")
+    else:
+        print(f"Class Diversity Check: PASSED (Test set has {len(unique_labels)} classes)")
+    print("="*30 + "\n")
 
-    print("Classification Report:")
-    print(classification_report(all_labels, all_preds, digits=4))
-    print("Confusion Matrix:")
-    print(confusion_matrix(all_labels, all_preds))
-
+# --- MODEL DEFINITION ---
 class SimpleCNN(nn.Module):
-    def __init__(self, in_channels=2, n_classes=5):  # in_channels=2 for ch1 + ch2
+    def __init__(self, in_channels=2, n_classes=5):
         super(SimpleCNN, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=5, padding=2)
         self.pool1 = nn.MaxPool1d(2)
         self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
         self.pool2 = nn.MaxPool1d(2)
-        self.fc1 = nn.Linear(64 * 1920, 128)  # 7680/2/2=1920
+        
+        # ADDED: Dropout for regularization
+        self.dropout = nn.Dropout(p=0.5)
+        
+        self.fc1 = nn.Linear(64 * 1920, 128) 
         self.fc2 = nn.Linear(128, n_classes)
 
     def forward(self, x):
         x = self.pool1(F.relu(self.conv1(x)))
         x = self.pool2(F.relu(self.conv2(x)))
         x = x.view(x.size(0), -1)
+        x = self.dropout(x) # Dropout active during training
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         return self.fc2(x)
 
-      
+# --- UTILS ---
+def list_to_dataset(data_list):
+    """Efficiently converts list of tuples to TensorDataset."""
+    # data_list items: (ch1, ch2, label, patient_no)
+    
+    # Pre-allocate tensors for speed
+    n_samples = len(data_list)
+    c_len = data_list[0][0].shape[0] # Assuming 7680
+    
+    x_tensor = torch.zeros((n_samples, 2, c_len))
+    y_tensor = torch.zeros((n_samples), dtype=torch.long)
+    
+    for i, (ch1, ch2, label, _) in enumerate(data_list):
+        x_tensor[i, 0, :] = ch1
+        x_tensor[i, 1, :] = ch2
+        y_tensor[i] = label
+        
+    return TensorDataset(x_tensor, y_tensor)
+
 def load_labeled_data(folds, base_path):
     data = []
+    print(f"Loading folds: {folds}...")
     for fold in folds:
-        train_set = torch.load(os.path.join(base_path, str(fold), "train_set.pt"), weights_only=False)
-        data.extend(train_set)
+        path = os.path.join(base_path, str(fold), "train_set.pt")
+        if os.path.exists(path):
+            train_set = torch.load(path, weights_only=False) # Weights_only=False for legacy files
+            data.extend(train_set)
+        else:
+            print(f"Warning: Path not found {path}")
+    print(f"Loaded {len(data)} samples.")
     return data
 
-def train_model(model, train_data, device, epochs=300, lr=1e-3, patience=20):
-    train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+def evaluate_model(model, test_dataset, device):
+    model.eval()
+    loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            out = model(x)
+            preds = torch.argmax(out, dim=1).cpu().tolist()
+            all_preds.extend(preds)
+            all_labels.extend(y.tolist())
+
+    print("\n--- FINAL EVALUATION ---")
+    print(classification_report(all_labels, all_preds, digits=4))
+    print("Confusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
+    return all_preds
+
+# --- TRAINING LOOP ---
+def train_model(model, train_dataset, device, epochs, lr=1e-3):
+    # Split train into Train/Val for internal monitoring
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_sub, val_sub = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_sub, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_sub, batch_size=64, shuffle=False)
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    model.train()
     
-    best_loss = float('inf')
-    wait = 0
-
+    print(f"Starting training on {len(train_dataset)} samples ({train_size} train, {val_size} val)")
+    
     for epoch in range(epochs):
+        model.train()
         total_loss = 0
-        correct = 0
-        total = 0
-
+        
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
@@ -93,107 +171,54 @@ def train_model(model, train_data, device, epochs=300, lr=1e-3, patience=20):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            
+        # Validation step
+        model.eval()
+        val_correct = 0
+        with torch.no_grad():
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                v_out = model(vx)
+                v_pred = torch.argmax(v_out, dim=1)
+                val_correct += (v_pred == vy).sum().item()
+        
+        val_acc = val_correct / len(val_sub)
+        avg_loss = total_loss / len(train_loader)
+        
+        if (epoch + 1) % 5 == 0:
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
 
-            preds = torch.argmax(outputs, dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
-
-        avg_loss = total_loss
-        acc = correct / total
-
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}, Loss = {avg_loss:.4f}, Accuracy = {acc:.4f}")
-
-        # Early stopping check
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            wait = 0
-        else:
-            wait += 1
-            if wait >= patience:
-                print(f"Early stopping triggered at epoch {epoch+1}")
-                break
-
-def generate_pseudo_labels(model, unlabeled_folds, base_path, device, threshold=0.9):
-    pseudo_data = []
-    model.eval()
-    with torch.no_grad():
-        for fold in unlabeled_folds:
-            val_set = torch.load(os.path.join(base_path, str(fold), "val_set.pt"), weights_only=False)
-            for ch1, ch2, label, patient_no in val_set:
-                x = torch.stack([ch1, ch2], dim=0).unsqueeze(0).to(device)  # [1, 2, 7680]
-                out = model(x)
-                prob = F.softmax(out, dim=1)
-                confidence, pred = torch.max(prob, dim=1)
-                if confidence.item() >= threshold:
-                    pseudo_data.append((torch.stack([ch1, ch2], dim=0), pred.item()))
-    return pseudo_data
-
-
-def combine_and_retrain(model, labeled_data, pseudo_data, device):
-    # Step 1: Create a TensorDataset for the pseudo-labeled data
-    x_pseudo = torch.stack([x for x, y in pseudo_data])
-    y_pseudo = torch.tensor([y for x, y in pseudo_data])
-    pseudo_dataset = TensorDataset(x_pseudo, y_pseudo)
-    
-    # Step 2: Convert the original labeled data into a TensorDataset
-    converted_labeled = []
-    for ch1, ch2, label, _ in labeled_data:
-        x = torch.stack([ch1, ch2], dim=0)
-        converted_labeled.append((x, label))
-    
-    x_labeled = torch.stack([x for x, y in converted_labeled])
-    y_labeled = torch.tensor([y for x, y in converted_labeled])
-    labeled_dataset = TensorDataset(x_labeled, y_labeled)
-    
-    # Step 3: Combine both datasets
-    full_x = torch.cat([x_labeled, x_pseudo], dim=0)
-    full_y = torch.cat([y_labeled, y_pseudo], dim=0)
-    full_dataset = TensorDataset(full_x, full_y)
-    
-    # Step 4: Call the train_model function with the CORRECT full_dataset
-    train_model(model, full_dataset, device) 
-
+# --- MAIN ---
 if __name__ == "__main__":
-    base_path = "/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch"
+    args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
+    # 1. Load Data
     labeled_folds = [0, 2, 4, 6, 8]
-    unlabeled_folds = [i for i in range(0, 62, 2) if (i not in labeled_folds and i != 10)]
+    test_fold = 10
+    
+    labeled_data = load_labeled_data(labeled_folds, args.data_dir)
+    test_data_raw = torch.load(os.path.join(args.data_dir, str(test_fold), "val_set.pt"), weights_only=False)
 
-    labeled_data = load_labeled_data(labeled_folds, base_path)
+    # 2. Run Sanity Checks (Don't skip this!)
+    perform_sanity_checks(labeled_data, test_data_raw)
+
+    # 3. Prepare Datasets
+    print("Converting data to TensorDatasets...")
+    train_dataset = list_to_dataset(labeled_data)
+    test_dataset = list_to_dataset(test_data_raw)
+
+    # 4. Init Model
     model = SimpleCNN().to(device)
 
-    print("Step 1: Training initial model")
-    # Convert labeled_data to TensorDataset before training
-    converted_labeled = []
-    for ch1, ch2, label, _ in labeled_data:
-        x = torch.stack([ch1, ch2], dim=0)
-        converted_labeled.append((x, label))
-    
-    x_labeled = torch.stack([x for x, y in converted_labeled])
-    y_labeled = torch.tensor([y for x, y in converted_labeled])
-    labeled_dataset = TensorDataset(x_labeled, y_labeled)
+    # 5. Train
+    train_model(model, train_dataset, device, epochs=args.epochs, lr=args.lr)
 
-    train_model(model, labeled_dataset, device)
+    # 6. Evaluate
+    evaluate_model(model, test_dataset, device)
 
-    print("Step 2: Generating pseudo labels")
-    pseudo_data = generate_pseudo_labels(model, unlabeled_folds, base_path, device)
-
-    print(f"Generated {len(pseudo_data)} pseudo-labeled samples")
-
-    print("Step 3: Retraining on full data")
-    combine_and_retrain(model, labeled_data, pseudo_data, device)
-
-    print("Step 4: Evaluate on held-out test fold")
-    test_fold = 10  
-    test_set = torch.load(os.path.join(base_path, str(test_fold), "val_set.pt"), weights_only=False)
-    evaluate_model(model, test_set, device)
-    
-    SCRATCH_SAVE_PATH = os.path.join(os.environ['SCRATCH'], "semi_model_CNN.pt") 
-    
-    # Save the model to high-quota scratch space
-    torch.save(model.state_dict(), SCRATCH_SAVE_PATH)
-    print("Model saved as semi_model_CNN.pt")
-  
-    print("Done!")
+    # 7. Save
+    save_path = os.path.join(args.scratch_dir, "semi_model_CNN_final.pt")
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
