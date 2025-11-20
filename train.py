@@ -130,7 +130,10 @@ def train_loop(model, train_data, device, epochs, lr, phase_name="Supervised"):
     print(f"Class Weights: {class_weights.cpu().numpy()}")
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4) # Added weight_decay
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+    
+    # FIXED: Removed verbose=True to support all PyTorch versions
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     for epoch in range(epochs):
