@@ -16,13 +16,14 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch")
     parser.add_argument("--scratch_dir", type=str, default=os.getenv("SCRATCH", "./"))
+    parser.add_argument("--target_fold", type=int, default=10, help="The fold to use for Testing")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--confidence_threshold", type=float, default=0.90)
     parser.add_argument("--patience", type=int, default=15)
     return parser.parse_args()
 
-# --- IMPROVED DEEP CNN ARCHITECTURE ---
+# --- IMPROVED DEEP CNN ---
 class ImprovedSleepCNN(nn.Module):
     def __init__(self, in_channels=2, n_classes=5):
         super(ImprovedSleepCNN, self).__init__()
@@ -52,8 +53,7 @@ class ImprovedSleepCNN(nn.Module):
         x = self.dropout(x)
         return self.fc(x)
 
-# --- MEMORY EFFICIENT DATASET ---
-# REPLACES list_to_dataset to avoid memory duplication
+# --- DATASET CLASS ---
 class SleepDataset(Dataset):
     def __init__(self, data_list):
         self.data = data_list
@@ -62,65 +62,58 @@ class SleepDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # data_list item structure: (ch1, ch2, label, pid)
+        # item: (ch1, ch2, label, pid)
         item = self.data[idx]
-        
-        # Stack channels on the fly (Zero memory cost until training)
         x = torch.stack([item[0], item[1]], dim=0)
-        
         label = item[2]
         if isinstance(label, torch.Tensor): label = label.item()
-        y = int(label)
-        
-        return x, y
+        return x, int(label)
 
-def load_folds(folds, base_path, folder_type="train_set.pt"):
-    data = []
-    print(f"   Loading {len(folds)} folds: {folds}...")
-    for fold in folds:
-        path = os.path.join(base_path, str(fold), folder_type)
-        if os.path.exists(path):
-            data.extend(torch.load(path, weights_only=False))
+# --- HELPER FUNCTIONS ---
+def load_single_fold(base_path, fold_idx, filename):
+    path = os.path.join(base_path, str(fold_idx), filename)
+    print(f"   Loading file: {path}...")
+    data = torch.load(path, weights_only=False)
     return data
 
-def filter_leakage(data_list, banned_pids):
-    clean_data = []
-    for item in data_list:
+def split_labeled_unlabeled(full_train_data, labeled_pids):
+    """Splits the training data into Labeled and Unlabeled based on Patient IDs."""
+    labeled = []
+    unlabeled = []
+    
+    for item in full_train_data:
         pid = item[3]
         if isinstance(pid, torch.Tensor): pid = int(pid.item())
-        if pid not in banned_pids:
-            clean_data.append(item)
-    return clean_data
+        
+        if pid in labeled_pids:
+            labeled.append(item)
+        else:
+            unlabeled.append(item)
+            
+    return labeled, unlabeled
 
 def get_class_weights(train_data, device):
-    # Efficiently extract labels without loading full tensors
     labels = [int(x[2].item()) if isinstance(x[2], torch.Tensor) else int(x[2]) for x in train_data]
     classes = np.unique(labels)
     weights = compute_class_weight(class_weight='balanced', classes=classes, y=labels)
     return torch.tensor(weights, dtype=torch.float).to(device)
 
-# --- STABILIZED TRAINING LOOP ---
+# --- TRAINING LOOP ---
 def train_loop(model, train_data, device, epochs, lr, patience, phase_name="Supervised"):
-    patient_ids = sorted(list(set([item[3] for item in train_data])))
+    # Internal Val Split
+    patient_ids = sorted(list(set([int(item[3].item()) if isinstance(item[3], torch.Tensor) else int(item[3]) for item in train_data])))
     split_idx = int(len(patient_ids) * 0.85)
     train_pids = set(patient_ids[:split_idx])
-    val_pids = set(patient_ids[split_idx:])
     
-    train_subset = [x for x in train_data if x[3] in train_pids]
-    val_subset = [x for x in train_data if x[3] in val_pids]
+    train_subset = [x for x in train_data if (int(x[3].item()) if isinstance(x[3], torch.Tensor) else int(x[3])) in train_pids]
+    val_subset = [x for x in train_data if (int(x[3].item()) if isinstance(x[3], torch.Tensor) else int(x[3])) not in train_pids]
     
     print(f"[{phase_name}] Train: {len(train_subset)} | Val: {len(val_subset)}")
 
-    # Use Custom Dataset Class
-    train_ds = SleepDataset(train_subset)
-    val_ds = SleepDataset(val_subset)
-
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=4)
+    train_loader = DataLoader(SleepDataset(train_subset), batch_size=128, shuffle=True, num_workers=4)
+    val_loader = DataLoader(SleepDataset(val_subset), batch_size=128, shuffle=False, num_workers=4)
     
     class_weights = get_class_weights(train_subset, device)
-    print(f"   Class Weights: {class_weights.cpu().numpy()}")
-
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=4)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -173,48 +166,36 @@ def train_loop(model, train_data, device, epochs, lr, patience, phase_name="Supe
     
     model.load_state_dict(best_model_wts)
 
-# --- STREAMING PSEUDO LABELS ---
-def stream_pseudo_labels(model, fold_list, device, banned_pids, data_dir, threshold=0.90):
+def generate_pseudo_labels(model, unlabeled_data, device, threshold=0.90):
     model.eval()
-    all_pseudo_data = []
-    chunk_size = 5 
+    pseudo_data = []
+    batch_size = 128
     
-    print(f"\nStarting Streaming Pseudo-Labeling on {len(fold_list)} folds...")
+    # Chunking to save memory during inference
+    print(f"Generating pseudo-labels for {len(unlabeled_data)} samples...")
     
-    chunks = [fold_list[i:i + chunk_size] for i in range(0, len(fold_list), chunk_size)]
+    with torch.no_grad():
+        for i in range(0, len(unlabeled_data), batch_size):
+            batch = unlabeled_data[i:i+batch_size]
+            # Manually stack batch
+            x_batch = torch.zeros((len(batch), 2, 7680))
+            for j, item in enumerate(batch):
+                x_batch[j, 0, :] = item[0]
+                x_batch[j, 1, :] = item[1]
+            
+            x_batch = x_batch.to(device)
+            outputs = model(x_batch)
+            probs = F.softmax(outputs, dim=1)
+            conf, preds = torch.max(probs, dim=1)
+            
+            for j in range(len(batch)):
+                if conf[j].item() >= threshold:
+                    orig = batch[j]
+                    # Structure: (ch1, ch2, PSEUDO_LABEL, pid)
+                    pseudo_data.append((orig[0], orig[1], preds[j].item(), orig[3]))
     
-    for i, chunk_folds in enumerate(chunks):
-        print(f"   Processing Chunk {i+1}/{len(chunks)}: Folds {chunk_folds}")
-        chunk_raw = load_folds(chunk_folds, data_dir, "train_set.pt")
-        chunk_clean = filter_leakage(chunk_raw, banned_pids)
-        
-        batch_size = 128
-        chunk_pseudo = []
-        with torch.no_grad():
-            for k in range(0, len(chunk_clean), batch_size):
-                batch = chunk_clean[k:k+batch_size]
-                x_batch = torch.zeros((len(batch), 2, 7680))
-                for j, item in enumerate(batch):
-                    x_batch[j, 0, :] = item[0]
-                    x_batch[j, 1, :] = item[1]
-                
-                x_batch = x_batch.to(device)
-                outputs = model(x_batch)
-                probs = F.softmax(outputs, dim=1)
-                conf, preds = torch.max(probs, dim=1)
-                
-                for j in range(len(batch)):
-                    if conf[j].item() >= threshold:
-                        orig = batch[j]
-                        chunk_pseudo.append((orig[0], orig[1], preds[j].item(), orig[3]))
-        
-        print(f"   -> Chunk produced {len(chunk_pseudo)} pseudo-labels.")
-        all_pseudo_data.extend(chunk_pseudo)
-        del chunk_raw, chunk_clean, chunk_pseudo
-        gc.collect()
-        
-    print(f"Total Pseudo-Labels Generated: {len(all_pseudo_data)}")
-    return all_pseudo_data
+    print(f"-> Generated {len(pseudo_data)} pseudo-labels.")
+    return pseudo_data
 
 # --- MAIN ---
 if __name__ == "__main__":
@@ -222,33 +203,51 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    test_path = os.path.join(args.data_dir, "10", "val_set.pt")
-    test_data_raw = torch.load(test_path, weights_only=False)
-    banned_pids = set([int(item[3].item()) if isinstance(item[3], torch.Tensor) else int(item[3]) for item in test_data_raw])
-    print(f"BANNED PATIENTS: {banned_pids}")
-
-    labeled_folds = [0, 2, 4, 6, 8]
-    labeled_data = load_folds(labeled_folds, args.data_dir)
-    labeled_data = filter_leakage(labeled_data, banned_pids)
+    # 1. LOAD FOLD 10 (Contains ALL training data except Patients 10 & 11)
+    # This file is ~100GB. We load it ONCE.
+    print(f"\n--- LOADING FOLD {args.target_fold} MASTER DATA ---")
+    full_train_data = load_single_fold(args.data_dir, args.target_fold, "train_set.pt")
     
-    print("\n--- Training Teacher (Improved Architecture) ---")
+    # 2. DEFINE LABELED PATIENTS
+    # We treat Patients 0-9 as "Labeled". Everyone else (12-61) is "Unlabeled".
+    # Note: Patients 10 & 11 are NOT in this file (they are in val_set.pt), so no leakage risk.
+    labeled_pids = set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    print(f"Labeled Patients: {labeled_pids}")
+    
+    # 3. SPLIT DATA IN MEMORY
+    print("Splitting data into Labeled and Unlabeled...")
+    labeled_data, unlabeled_data = split_labeled_unlabeled(full_train_data, labeled_pids)
+    
+    # Free up the massive full_train_data list to save RAM
+    del full_train_data
+    gc.collect()
+    
+    print(f"Labeled Samples: {len(labeled_data)}")
+    print(f"Unlabeled Samples: {len(unlabeled_data)}")
+    
+    # 4. TRAIN TEACHER
+    print("\n--- Training Teacher ---")
     model = ImprovedSleepCNN().to(device)
     train_loop(model, labeled_data, device, epochs=40, lr=args.lr, patience=args.patience, phase_name="Teacher")
-
-    all_folds = [i for i in range(0, 62, 2)]
-    exclude_folds = set(labeled_folds + [10])
-    unlabeled_folds = [f for f in all_folds if f not in exclude_folds]
     
-    pseudo_data = stream_pseudo_labels(model, unlabeled_folds, device, banned_pids, args.data_dir, args.confidence_threshold)
+    # 5. PSEUDO LABELING
+    print("\n--- Generating Pseudo Labels ---")
+    pseudo_data = generate_pseudo_labels(model, unlabeled_data, device, threshold=args.confidence_threshold)
     
+    # Free Unlabeled Data to save RAM (we only need pseudo_data now)
+    del unlabeled_data
+    gc.collect()
+    
+    # 6. TRAIN STUDENT
     full_data = labeled_data + pseudo_data
     print(f"\n--- Retraining Student on {len(full_data)} samples ---")
     train_loop(model, full_data, device, epochs=80, lr=args.lr, patience=args.patience, phase_name="Student")
     
-    print("\n--- FINAL TEST FOLD 10 ---")
-    # Use SleepDataset here too
-    test_ds = SleepDataset(test_data_raw)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
+    # 7. FINAL TEST (Load Test Set Last to save memory)
+    print("\n--- FINAL TEST (Fold {args.target_fold} Validation Set) ---")
+    test_data = load_single_fold(args.data_dir, args.target_fold, "val_set.pt")
+    test_loader = DataLoader(SleepDataset(test_data), batch_size=128, shuffle=False)
+    
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -260,4 +259,4 @@ if __name__ == "__main__":
     print(classification_report(all_labels, all_preds, digits=4))
     print(confusion_matrix(all_labels, all_preds))
     
-    torch.save(model.state_dict(), os.path.join(args.scratch_dir, "improved_sleep_student_final.pt"))
+    torch.save(model.state_dict(), os.path.join(args.scratch_dir, "final_sleep_model.pt"))
