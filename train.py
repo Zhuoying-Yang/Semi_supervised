@@ -21,7 +21,7 @@ def get_args():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--confidence_threshold", type=float, default=0.92) 
-    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--patience", type=int, default=10)
     return parser.parse_args()
 
 # --- MODEL: DEEP CONTEXTUAL SLEEPNET ---
@@ -57,17 +57,12 @@ class DeepContextualSleepNet(nn.Module):
             ResidualBlock(256, 512, stride=2),
             nn.AdaptiveAvgPool1d(1)
         )
-        # Deep Bi-GRU (2 layers) for better temporal logic
         self.rnn = nn.GRU(512, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.3)
         self.dropout = nn.Dropout(0.5)
         self.fc = nn.Linear(512, n_classes)
 
-    def forward(self, x, noise_std=0.0):
-        if self.training and noise_std > 0:
-            x = x + torch.randn_like(x) * noise_std
-            
-        x = self.features(x).squeeze(-1) 
-        x = x.unsqueeze(1) 
+    def forward(self, x):
+        x = self.features(x).squeeze(-1).unsqueeze(1) 
         x, _ = self.rnn(x)
         x = self.dropout(x.squeeze(1))
         return self.fc(x)
@@ -80,7 +75,8 @@ def create_contextual_data(data_list):
         prev, curr, nxt = data_list[i-1], data_list[i], data_list[i+1]
         get_pid = lambda x: int(x[3].item() if isinstance(x[3], torch.Tensor) else x[3])
         if get_pid(prev) == get_pid(curr) == get_pid(nxt):
-            x = torch.cat([prev[0], prev[1], curr[0], curr[1], nxt[0], nxt[1]], dim=0)
+            # Simple scaling instead of full normalization to preserve amplitude features for Stage 3
+            x = torch.cat([prev[0], prev[1], curr[0], curr[1], nxt[0], nxt[1]], dim=0) * 10.0
             context_data.append((x, curr[2], get_pid(curr)))
     return context_data
 
@@ -91,32 +87,26 @@ class ContextDataset(Dataset):
         x, label, pid = self.data[idx]
         return x.view(6, -1), int(label.item() if isinstance(label, torch.Tensor) else label)
 
-# --- MIXUP AUGMENTATION ---
+# --- MIXUP LOGIC ---
 def mixup_data(x, y, alpha=0.2, device='cuda'):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
     batch_size = x.size()[0]
     index = torch.randperm(batch_size).to(device)
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
 # --- TRAINING FUNCTIONS ---
 def train_phase(model, train_data, val_data, device, epochs, lr, patience, name, use_mixup=False):
     train_loader = DataLoader(ContextDataset(train_data), batch_size=128, shuffle=True, num_workers=4)
     val_loader = DataLoader(ContextDataset(val_data), batch_size=128, shuffle=False, num_workers=4)
     
-    weights = compute_class_weight('balanced', classes=np.unique([int(x[1]) for x in train_data]), y=[int(x[1]) for x in train_data])
-    weights = torch.tensor(np.clip(weights, 0.5, 3.0), dtype=torch.float).to(device)
+    labels = [int(x[1]) for x in train_data]
+    weights = torch.tensor(compute_class_weight('balanced', classes=np.unique(labels), y=labels), dtype=torch.float).to(device)
     
-    criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-3) # Heavy weight decay for generalization
+    # Label Smoothing Cross Entropy
+    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     best_acc, wait = 0.0, 0
@@ -130,11 +120,10 @@ def train_phase(model, train_data, val_data, device, epochs, lr, patience, name,
             
             if use_mixup:
                 inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=0.2, device=device)
-                outputs = model(inputs, noise_std=0.01)
-                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+                outputs = model(inputs)
+                loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
             else:
-                outputs = model(x, noise_std=0.01)
-                loss = criterion(outputs, y)
+                loss = criterion(model(x), y)
                 
             loss.backward()
             optimizer.step()
@@ -153,7 +142,6 @@ def train_phase(model, train_data, val_data, device, epochs, lr, patience, name,
         else:
             wait += 1
             if wait >= patience: break
-            
     model.load_state_dict(best_wts)
 
 # --- MAIN ---
@@ -161,10 +149,9 @@ if __name__ == "__main__":
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. LOAD & SORT
     raw_train_obj = torch.load(os.path.join(args.data_dir, str(args.target_fold), "train_set.pt"), weights_only=False)
     raw_train = [raw_train_obj[i] for i in range(len(raw_train_obj))]
-    raw_train.sort(key=lambda x: int(x[3].item() if isinstance(x[3], torch.Tensor) else x[3]))
+    raw_train.sort(key=lambda x: int(x[3]))
     context_train = create_contextual_data(raw_train)
     del raw_train; gc.collect()
 
@@ -172,13 +159,13 @@ if __name__ == "__main__":
     labeled = [x for x in context_train if int(x[2]) in labeled_pids]
     unlabeled = [x for x in context_train if int(x[2]) not in labeled_pids]
 
-    # 2. TEACHER (No mixup here, focus on clean labels)
     model = DeepContextualSleepNet().to(device)
     random.shuffle(labeled)
-    split_idx = int(0.85 * len(labeled))
-    train_phase(model, labeled[:split_idx], labeled[split_idx:], device, 40, args.lr, args.patience, "Teacher")
+    split = int(0.85 * len(labeled))
+    
+    print("\n--- Phase 1: Training Teacher ---")
+    train_phase(model, labeled[:split], labeled[split:], device, 40, args.lr, args.patience, "Teacher")
 
-    # 3. PSEUDO LABELING
     model.eval(); bins = {i: [] for i in range(5)}
     with torch.no_grad():
         for i in range(0, len(unlabeled), 128):
@@ -192,17 +179,18 @@ if __name__ == "__main__":
 
     final_pseudo = []
     for c in range(5):
-        sample_size = min(len(bins[c]), 5000) 
+        sample_size = min(len(bins[c]), 4000) 
         if sample_size > 0: final_pseudo += random.sample(bins[c], sample_size)
+        print(f"  Class {c}: {sample_size} labels")
     
-    # 4. STUDENT (With MIXUP and Noise)
+    print("\n--- Phase 3: Training Student with Mixup ---")
     combined = labeled + final_pseudo
     random.shuffle(combined)
-    split_idx = int(0.85 * len(combined))
-    train_phase(model, combined[:split_idx], combined[split_idx:], device, args.epochs, args.lr * 0.3, args.patience, "Student", use_mixup=True)
+    split = int(0.85 * len(combined))
+    train_phase(model, combined[:split], combined[split:], device, args.epochs, args.lr * 0.5, args.patience, "Student", use_mixup=True)
 
-    # 5. TEST
-    raw_test_obj = torch.load(os.path.join(args.data_dir, str(args.target_fold), "val_set.pt"), weights_only=False)
+    test_path = os.path.join(args.data_dir, str(args.target_fold), "val_set.pt")
+    raw_test_obj = torch.load(test_path, weights_only=False)
     raw_test = [raw_test_obj[i] for i in range(len(raw_test_obj))]; raw_test.sort(key=lambda x: int(x[3])); context_test = create_contextual_data(raw_test)
     test_loader = DataLoader(ContextDataset(context_test), batch_size=128, shuffle=False)
     model.eval(); all_p, all_y = [], []
