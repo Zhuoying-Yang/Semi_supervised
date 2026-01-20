@@ -10,13 +10,11 @@ import numpy as np
 import random
 import gc
 
-# --- 1. THE REPRODUCIBILITY ANCHOR ---
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Ensures deterministic algorithms on Narval's NVIDIA GPUs
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -32,8 +30,20 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     return parser.parse_args()
 
-# --- AUGMENTATION: SEQUENCE MIXUP ---
 def mixup_seq(x, y, alpha=0.2):
+    '''
+    Performs Manifold Mixup augmentation on temporal sleep sequences.
+    
+    Use linear interpolation to create synthetic training samples. 
+    This regularizes the model by forcing it to learn smooth decision 
+    boundaries between sleep stages, which is critical for preventing 
+    overfitting in the 10% labeled data.
+    
+    Args:
+        x: Input tensor of shape (Batch, Seq, Ch, Time)
+        y: Ground truth labels for the sequence
+        alpha: The Beta distribution parameter controlling the mixing strength
+    '''
     if alpha > 0: lam = np.random.beta(alpha, alpha)
     else: lam = 1
     batch_size = x.size()[0]
@@ -42,7 +52,7 @@ def mixup_seq(x, y, alpha=0.2):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-# --- SOTA MODEL ARCHITECTURE ---
+# MODEL ARCHITECTURE
 class MultiScaleCNN(nn.Module):
     def __init__(self, in_channels=2):
         super().__init__()
