@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 import random
 import gc
@@ -21,29 +20,18 @@ def set_seed(seed=42):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch")
-    parser.add_argument("--save_path", type=str, default="reproducible_sota.pth")
-    parser.add_argument("--target_fold", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=40) # Global Seed
+    parser.add_argument("--save_dir", type=str, default="/scratch/zhuoying/sleep_results")
+    parser.add_argument("--save_name", type=str, default="resumed_sota_best.pth")
+    parser.add_argument("--seed", type=int, default=40) 
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--seq_len", type=int, default=21) 
     parser.add_argument("--burn_in", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--start_fold", type=int, default=24) 
+    parser.add_argument("--save_weights", type=bool, default=False) 
     return parser.parse_args()
 
 def mixup_seq(x, y, alpha=0.2):
-    '''
-    Performs Manifold Mixup augmentation on temporal sleep sequences.
-    
-    Use linear interpolation to create synthetic training samples. 
-    This regularizes the model by forcing it to learn smooth decision 
-    boundaries between sleep stages, which is critical for preventing 
-    overfitting in the 10% labeled data.
-    
-    Args:
-        x: Input tensor of shape (Batch, Seq, Ch, Time)
-        y: Ground truth labels for the sequence
-        alpha: The Beta distribution parameter controlling the mixing strength
-    '''
     if alpha > 0: lam = np.random.beta(alpha, alpha)
     else: lam = 1
     batch_size = x.size()[0]
@@ -52,7 +40,7 @@ def mixup_seq(x, y, alpha=0.2):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-# MODEL ARCHITECTURE
+# --- MODEL ARCHITECTURE ---
 class MultiScaleCNN(nn.Module):
     def __init__(self, in_channels=2):
         super().__init__()
@@ -109,37 +97,28 @@ def create_sequences(data_list, seq_len=21):
             cur_x.pop(0); cur_y.pop(0)
     return sequences
 
+# --- RUNNER ---
 def run_fold(target_fold, args, device):
-    print(f"\n--- STARTING FOLD: {target_fold} (SEED: {args.seed}) ---")
-    set_seed(args.seed) # Fixed Seed
+    print(f"\n--- PROCESSING FOLD: {target_fold} ---")
+    set_seed(args.seed)
 
-    # Fixed Data Splitting
     train_obj = torch.load(os.path.join(args.data_dir, str(target_fold), "train_set.pt"), weights_only=False)
     train_list = [train_obj[i] for i in range(len(train_obj))]
     
-    # 2. FIXED PATIENT SPLIT
     pids = sorted(list(set([int(x[3]) for x in train_list])))
-    # Deterministic shuffle using a private Random instance
     rng = random.Random(args.seed)
     rng.shuffle(pids)
     labeled_pids = pids[:max(1, int(len(pids)*0.1))]
-    print(f"Fixed Labeled PIDs for Fold {target_fold}: {labeled_pids}")
     
     l_seqs = create_sequences([x for x in train_list if int(x[3]) in labeled_pids], args.seq_len)
     u_seqs = create_sequences([x for x in train_list if int(x[3]) not in labeled_pids], args.seq_len)
     del train_obj, train_list; gc.collect()
 
-    # Generator for reproducible shuffling in DataLoader
-    g = torch.Generator()
-    g.manual_seed(args.seed)
+    l_loader = DataLoader(SeqDataset(l_seqs), batch_size=16, shuffle=True)
+    u_loader = DataLoader(SeqDataset(u_seqs), batch_size=16, shuffle=True)
 
-    l_loader = DataLoader(SeqDataset(l_seqs), batch_size=16, shuffle=True, generator=g)
-    u_loader = DataLoader(SeqDataset(u_seqs), batch_size=16, shuffle=True, generator=g)
-
-    # Pre-loading Validation once per fold
     val_obj = torch.load(os.path.join(args.data_dir, str(target_fold), "val_set.pt"), weights_only=False)
-    val_sequences = create_sequences([val_obj[i] for i in range(len(val_obj))], args.seq_len)
-    val_loader = DataLoader(SeqDataset(val_sequences), batch_size=32)
+    val_loader = DataLoader(SeqDataset(create_sequences([val_obj[i] for i in range(len(val_obj))], args.seq_len)), batch_size=32)
     del val_obj; gc.collect()
 
     model = SOTASleepNet().to(device)
@@ -147,12 +126,14 @@ def run_fold(target_fold, args, device):
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1)
 
     best_acc = 0
-    patience = 0
-    fold_save_path = f"fold_{target_fold}_{args.save_path}"
     
     for epoch in range(args.epochs):
         model.train()
         u_iter = iter(u_loader)
+        
+        # Initialize ramp_weight at start of epoch to avoid UnboundLocalError
+        current_ramp_weight = 0.0
+        
         for x_l, y_l in l_loader:
             try: x_u, _ = next(u_iter)
             except: u_iter = iter(u_loader); x_u, _ = next(u_iter)
@@ -167,9 +148,14 @@ def run_fold(target_fold, args, device):
 
             loss_unsup = torch.tensor(0.0).to(device)
             if epoch >= args.burn_in:
+                # STABILITY FIX: Linear ramp-up to a lower max weight (0.2)
+                current_ramp_weight = min(0.2, 0.2 * (epoch - args.burn_in + 1) / (args.epochs - args.burn_in))
+                
                 with torch.no_grad():
-                    t_probs = F.softmax(model(x_u + torch.randn_like(x_u)*0.005) / 1.2, dim=-1)
-                loss_unsup = 0.4 * F.kl_div(F.log_softmax(model(x_u), dim=-1), t_probs, reduction='batchmean')
+                    # SHARPENING: Use temperature 0.5 to make teacher more decisive
+                    t_probs = F.softmax(model(x_u + torch.randn_like(x_u)*0.005) / 0.5, dim=-1)
+                
+                loss_unsup = current_ramp_weight * F.kl_div(F.log_softmax(model(x_u), dim=-1), t_probs, reduction='batchmean')
 
             (loss_sup + loss_unsup).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -177,7 +163,6 @@ def run_fold(target_fold, args, device):
         
         scheduler.step()
 
-        # Validation
         model.eval(); all_p, all_y = [], []
         with torch.no_grad():
             for vx, vy in val_loader:
@@ -187,40 +172,27 @@ def run_fold(target_fold, args, device):
         acc = np.mean(np.array(all_p) == np.array(all_y))
         if acc > best_acc:
             best_acc = acc
-            torch.save(model.state_dict(), fold_save_path)
-            print(f"** BEST ACC (FOLD {target_fold}): {best_acc:.4f} **")
-            patience = 0
-        else:
-            patience += 1
+            if args.save_weights:
+                torch.save(model.state_dict(), os.path.join(args.save_dir, f"fold_{target_fold}_{args.save_name}"))
         
-        if patience > 20: break
-            
-        print(f"Fold {target_fold} | Epoch {epoch+1} | Acc: {acc:.4f}")
+        print(f"Fold {target_fold} | Epoch {epoch+1} | Acc: {acc:.4f} (SSL Weight: {current_ramp_weight:.3f})")
 
     return best_acc
 
-# --- MAIN ---
 if __name__ == "__main__":
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Discovering all folders in the data directory that are numeric
     all_folds = sorted([int(f) for f in os.listdir(args.data_dir) if f.isdigit()])
-    print(f"Found folds: {all_folds}")
+    remaining_folds = [f for f in all_folds if f >= args.start_fold]
+    print(f"Resuming from fold {args.start_fold}. Folds to process: {remaining_folds}")
 
-    overall_results = {}
+    results = {}
+    for f in remaining_folds:
+        fold_acc = run_fold(f, args, device)
+        results[f] = fold_acc
 
-    for f in all_folds:
-        fold_accuracy = run_fold(f, args, device)
-        overall_results[f] = fold_accuracy
-
-    # Final Summary
-    print("\n" + "="*30)
-    print("ALL FOLDS COMPLETE")
-    print("="*30)
-    accuracies = list(overall_results.values())
-    for f_id, f_acc in overall_results.items():
-        print(f"Fold {f_id}: {f_acc:.4f}")
-    
-    print(f"\nMean Accuracy: {np.mean(accuracies):.4f}")
+    accuracies = list(results.values())
+    print("\n" + "="*30 + f"\nRESUMED SUMMARY (FOLDS {args.start_fold}+)\n" + "="*30)
+    print(f"Mean Accuracy: {np.mean(accuracies):.4f}")
     print(f"Std Deviation: {np.std(accuracies):.4f}")
