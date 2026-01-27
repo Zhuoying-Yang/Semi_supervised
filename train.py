@@ -21,13 +21,12 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="/home/zhuoying/projects/def-xilinliu/data/extracted_data_2ch")
     parser.add_argument("--save_dir", type=str, default="/scratch/zhuoying/sleep_results")
-    parser.add_argument("--save_name", type=str, default="resumed_sota_best.pth")
+    parser.add_argument("--save_name", type=str, default="cnn_only_full.pth")
     parser.add_argument("--seed", type=int, default=40) 
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--seq_len", type=int, default=21) 
     parser.add_argument("--burn_in", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--start_fold", type=int, default=24) 
     parser.add_argument("--save_weights", type=bool, default=False) 
     return parser.parse_args()
 
@@ -63,17 +62,28 @@ class MultiScaleCNN(nn.Module):
     def forward(self, x):
         return torch.cat([self.stream_l(x).flatten(1), self.stream_s(x).flatten(1)], dim=1)
 
-class SOTASleepNet(nn.Module):
+class CNNOnlySleepNet(nn.Module):
     def __init__(self, n_classes=5):
         super().__init__()
-        self.cnn = MultiScaleCNN()
-        self.rnn = nn.LSTM(256, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.5)
+        self.cnn_backbone = MultiScaleCNN()
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Conv1d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU()
+        )
         self.fc = nn.Linear(512, n_classes)
+
     def forward(self, x):
         batch, seq, ch, time = x.size()
         x = x.view(batch * seq, ch, time)
-        feats = self.cnn(x).view(batch, seq, -1)
-        out, _ = self.rnn(feats)
+        feats = self.cnn_backbone(x)
+        feats = feats.view(batch, seq, 256).transpose(1, 2)
+        out = self.temporal_conv(feats)
+        out = out.transpose(1, 2)
         return self.fc(out)
 
 class SeqDataset(Dataset):
@@ -99,9 +109,10 @@ def create_sequences(data_list, seq_len=21):
 
 # --- RUNNER ---
 def run_fold(target_fold, args, device):
-    print(f"\n--- PROCESSING FOLD: {target_fold} ---")
+    print(f"\n--- PROCESSING FOLD: {target_fold} (CNN-ONLY) ---")
     set_seed(args.seed)
 
+    # Data Loading
     train_obj = torch.load(os.path.join(args.data_dir, str(target_fold), "train_set.pt"), weights_only=False)
     train_list = [train_obj[i] for i in range(len(train_obj))]
     
@@ -121,17 +132,14 @@ def run_fold(target_fold, args, device):
     val_loader = DataLoader(SeqDataset(create_sequences([val_obj[i] for i in range(len(val_obj))], args.seq_len)), batch_size=32)
     del val_obj; gc.collect()
 
-    model = SOTASleepNet().to(device)
+    # Model Setup
+    model = CNNOnlySleepNet().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=3e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1)
 
-    best_acc = 0
-    
     for epoch in range(args.epochs):
         model.train()
         u_iter = iter(u_loader)
-        
-        # Initialize ramp_weight at start of epoch to avoid UnboundLocalError
         current_ramp_weight = 0.0
         
         for x_l, y_l in l_loader:
@@ -139,6 +147,7 @@ def run_fold(target_fold, args, device):
             except: u_iter = iter(u_loader); x_u, _ = next(u_iter)
             x_l, y_l, x_u = x_l.to(device), y_l.to(device), x_u.to(device)
 
+            # Supervision Logic
             if random.random() > 0.5:
                 mixed_x, ya, yb, lam = mixup_seq(x_l, y_l)
                 loss_sup = lam * F.cross_entropy(model(mixed_x).view(-1, 5), ya.view(-1)) + \
@@ -146,15 +155,12 @@ def run_fold(target_fold, args, device):
             else:
                 loss_sup = F.cross_entropy(model(x_l).view(-1, 5), y_l.view(-1), label_smoothing=0.1)
 
+            # SSL Logic
             loss_unsup = torch.tensor(0.0).to(device)
             if epoch >= args.burn_in:
-                # STABILITY FIX: Linear ramp-up to a lower max weight (0.2)
                 current_ramp_weight = min(0.2, 0.2 * (epoch - args.burn_in + 1) / (args.epochs - args.burn_in))
-                
                 with torch.no_grad():
-                    # SHARPENING: Use temperature 0.5 to make teacher more decisive
                     t_probs = F.softmax(model(x_u + torch.randn_like(x_u)*0.005) / 0.5, dim=-1)
-                
                 loss_unsup = current_ramp_weight * F.kl_div(F.log_softmax(model(x_u), dim=-1), t_probs, reduction='batchmean')
 
             (loss_sup + loss_unsup).backward()
@@ -163,6 +169,7 @@ def run_fold(target_fold, args, device):
         
         scheduler.step()
 
+        # Validation
         model.eval(); all_p, all_y = [], []
         with torch.no_grad():
             for vx, vy in val_loader:
@@ -170,29 +177,15 @@ def run_fold(target_fold, args, device):
                 all_y.extend(vy.view(-1).tolist())
         
         acc = np.mean(np.array(all_p) == np.array(all_y))
-        if acc > best_acc:
-            best_acc = acc
-            if args.save_weights:
-                torch.save(model.state_dict(), os.path.join(args.save_dir, f"fold_{target_fold}_{args.save_name}"))
-        
         print(f"Fold {target_fold} | Epoch {epoch+1} | Acc: {acc:.4f} (SSL Weight: {current_ramp_weight:.3f})")
-
-    return best_acc
 
 if __name__ == "__main__":
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Detect all available folds
     all_folds = sorted([int(f) for f in os.listdir(args.data_dir) if f.isdigit()])
-    remaining_folds = [f for f in all_folds if f >= args.start_fold]
-    print(f"Resuming from fold {args.start_fold}. Folds to process: {remaining_folds}")
+    print(f"Folds found: {all_folds}")
 
-    results = {}
-    for f in remaining_folds:
-        fold_acc = run_fold(f, args, device)
-        results[f] = fold_acc
-
-    accuracies = list(results.values())
-    print("\n" + "="*30 + f"\nRESUMED SUMMARY (FOLDS {args.start_fold}+)\n" + "="*30)
-    print(f"Mean Accuracy: {np.mean(accuracies):.4f}")
-    print(f"Std Deviation: {np.std(accuracies):.4f}")
+    for f in all_folds:
+        run_fold(f, args, device)
