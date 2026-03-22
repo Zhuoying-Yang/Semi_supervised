@@ -24,7 +24,7 @@ def get_args():
     parser.add_argument("--save_name", type=str, default="cnn_only_full.pth")
     parser.add_argument("--seed", type=int, default=40) 
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--seq_len", type=int, default=21) 
+    parser.add_argument("--seq_len", type=int, default=15) 
     parser.add_argument("--burn_in", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--save_weights", type=bool, default=False) 
