@@ -29,7 +29,7 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     return parser.parse_args()
 
-# --- MODEL ARCHITECTURE --- (Identical to your SSL version)
+# --- MODEL ARCHITECTURE --- 
 class MultiScaleCNN(nn.Module):
     def __init__(self, in_channels=2):
         super().__init__()
